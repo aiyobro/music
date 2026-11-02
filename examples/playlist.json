@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "platform": "qq",
+  "id": "my-import",
+  "name": "待迁移歌单示例",
+  "tracks": [
+    {"position": 1, "platform": "qq", "source_id": null, "name": "请替换歌名", "artists": ["请替换歌手"], "album": null, "url": null}
+  ]
+}

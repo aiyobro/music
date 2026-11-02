@@ -1,0 +1,9 @@
+# 本次 Windows Python 3.12.14 测试环境的应用依赖；不含测试媒体生成工具。
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.16.0
+certifi==2026.10.23
+idna==3.20
+typing_extensions==4.16.0
+mutagen==1.48.1
