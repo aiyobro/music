@@ -7,6 +7,7 @@ import re
 import sqlite3
 import time
 import unicodedata
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 
@@ -18,12 +19,24 @@ class AuthError(BridgeError):
     pass
 
 
+def retry_permission(operation):
+    # Windows 的扫描器或查看器可能短暂占用刚写完的文件；不改变 ACL 或强制删除。
+    for attempt, delay in enumerate((0.1, 0.25, 0.5, 1.0, 2.0)):
+        try:
+            return operation()
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(delay)
+
+
 def dump(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    serialized = json.dumps(value, ensure_ascii=False, indent=2)
+    retry_permission(lambda: tmp.write_text(serialized, encoding="utf-8"))
+    retry_permission(lambda: os.replace(tmp, path))
 
 
 def load(path):
@@ -35,8 +48,19 @@ def digest(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
+@lru_cache(maxsize=1)
+def chinese_converter():
+    try:
+        from opencc import OpenCC
+    except ImportError:
+        raise BridgeError("缺少繁简规范化依赖，请按 pyproject.toml 重新安装项目") from None
+    return OpenCC("t2s")
+
+
 def norm(value):
-    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value)).casefold())
+    # 仅统一繁简字形，不去掉版本词或歌手名字中的其他标记。
+    value = chinese_converter().convert(unicodedata.normalize("NFKC", str(value)))
+    return re.sub(r"\s+", "", value.casefold())
 
 
 def safe(value):
@@ -81,7 +105,7 @@ def identity(candidate):
 
 
 DEFAULT = {"nas_root": "", "nas_profile": "music", "fnos_command": ["fnos-cli"],
-           "fnos_version": "0.5.1", "sources": ["netease", "joox"], "ffprobe": "ffprobe"}
+           "fnos_version": "0.5.1", "sources": ["netease", "joox"], "ffprobe": "ffprobe", "match_policy": "strict", "extras": True}
 
 
 class State:

@@ -3,15 +3,20 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
+import contextlib
+import signal
 from pathlib import Path
 from unittest.mock import patch
 import httpx
 from music_bridge.api import HTTP, QQ, qq_id, manifest
-from music_bridge.core import BridgeError, State, digest, dump, inside, match, safe
+from music_bridge.core import AuthError, BridgeError, State, digest, dump, inside, match, safe
 from music_bridge.engine import Engine, probe, tag
 from music_bridge.library import Library
 from music_bridge.nas import NAS
+from music_bridge.session import read_session
+from music_bridge.storage import LocalStorage
 
 
 class FakeNAS:
@@ -55,7 +60,7 @@ class FakeNAS:
             raise BridgeError("collision")
         self.files[dest] = b
         self.ensure(str(Path(dest).parent).replace("\\", "/"))
-    def move(self, src, dest):
+    def move(self, src, dest, expected_sha256=None):
         if self.exists(dest):
             raise BridgeError("collision")
         self.files[dest] = self.files.pop(src)
@@ -81,6 +86,70 @@ class FakeGD:
 
 
 class Tests(unittest.TestCase):
+    def test_cli_graceful_stop_restores_signal_handler(self):
+        from music_bridge.cli import main
+        before = signal.getsignal(signal.SIGTERM)
+        with patch("music_bridge.cli.execute", side_effect=KeyboardInterrupt), contextlib.redirect_stderr(io.StringIO()) as output:
+            self.assertEqual(main(["--home", self.tmp.name, "jobs", "status"]), 130)
+        self.assertIn('"stopped": true', output.getvalue())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_cli_progress_only_emits_changed_counts(self):
+        from music_bridge.cli import main
+        def operation(args, state):
+            job = {"id": "progress-test", "manifest": {}, "items": [{"status": "pending"}]}
+            state.save_job(job)
+            state.save_job(job)
+            job["items"][0]["status"] = "not_found"
+            state.save_job(job)
+            return {"states": {"not_found": 1}}
+        with patch("music_bridge.cli.execute", side_effect=operation), contextlib.redirect_stderr(io.StringIO()) as progress, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["--home", self.tmp.name, "--progress", "jobs", "status"]), 0)
+        rows = [json.loads(line) for line in progress.getvalue().splitlines()]
+        self.assertEqual([row["states"] for row in rows], [{"pending": 1}, {"not_found": 1}])
+
+    def test_local_backend_full_migration_resume_and_quarantine(self):
+        library = Path(self.tmp.name) / "library"
+        library.mkdir()
+        self.s.config.update(storage="local", library_root=str(library), extras=False)
+        self.nas = LocalStorage(self.s.config)
+        self.engine = Engine(self.s, self.nas, self.gd)
+        job = self.engine.create(self.manifest)
+        self.assertEqual(self.run_job(job)["states"], {"saved": 1})
+        record = job["items"][0]["record"]
+        target = library / record["path"]
+        self.assertTrue(target.exists())
+        self.assertEqual(digest(target), record["sha256"])
+        self.assertFalse(Path(job["items"][0]["local"]).exists())
+        self.assertFalse((library / ".music-bridge/writer.lock").exists())
+        self.assertEqual(self.run_job()["states"], {"existing": 1})
+        self.assertEqual(self.gd.downloads, 1)
+        selection = Path(self.tmp.name) / "selection.json"
+        dump(selection, {"nas_root": self.nas.root, "files": [{"path": record["path"], "sha256": record["sha256"]}]})
+        lib = Library(self.s, self.nas)
+        result = lib.quarantine(selection, True)
+        self.assertFalse(target.exists())
+        lib.restore(result["record"], True)
+        self.assertTrue(target.exists())
+
+    def test_local_backend_conflict_and_containment(self):
+        self.s.config["library_root"] = self.tmp.name
+        backend = LocalStorage(self.s.config)
+        local = Path(self.tmp.name) / "a.txt"
+        local.write_text("first")
+        backend.put(local, backend.root + "/dest/a.txt")
+        local.write_text("second")
+        with self.assertRaises(BridgeError):
+            backend.put(local, backend.root + "/dest/a.txt")
+        self.assertEqual(backend.read(backend.root + "/dest/a.txt"), b"first")
+        with self.assertRaises(BridgeError):
+            backend.path("/vol1/other/secret")
+        with self.assertRaises(BridgeError):
+            backend.path(backend.root + "/../secret")
+        backend.mkdir(backend.root + "/lock")
+        with self.assertRaises(BridgeError):
+            backend.mkdir(backend.root + "/lock")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -329,6 +398,196 @@ class Tests(unittest.TestCase):
         nas.run = lambda *a: {"unexpected": []}
         with self.assertRaises(BridgeError):
             nas.entries(nas.root)
+
+    def test_nas_flat_entries_and_empty_directory(self):
+        nas = NAS(self.s.config)
+        for rows in ([], [{"name": "test.mp3", "dir": 0}]):
+            nas.run = lambda *a, rows=rows: rows
+            self.assertEqual(nas.entries(nas.root), rows)
+
+    def test_nas_text_success_and_json_failure(self):
+        nas = NAS(self.s.config)
+        class Result:
+            returncode = 0
+            stdout = "Directory created"
+        with patch("music_bridge.nas.subprocess.run", return_value=Result()):
+            nas.mkdir(nas.root + "/test")
+            Result.stdout = '{"errno":17,"result":"fail"}'
+            with self.assertRaises(BridgeError):
+                nas.mkdir(nas.root + "/test")
+
+    def test_authorized_file_api_readback(self):
+        calls = []
+        def handler(r):
+            calls.append(r)
+            self.assertEqual(r.headers["Authorization"], "Bearer dummy-test-token")
+            if r.method == "POST":
+                self.assertEqual(json.loads(r.content)["paths"], ["/vol1/music/test.mp3"])
+                return httpx.Response(200, json={"token": "temporary-test-token"})
+            return httpx.Response(200, content=b"test bytes")
+        config = self.s.config | {"reuse_fnos_session": True}
+        nas = NAS(config, HTTP(httpx.Client(transport=httpx.MockTransport(handler))))
+        session = {"accessToken": "dummy-test-token", "accessTokenExpiresAt": time.time() + 3600}
+        with patch("music_bridge.nas.read_session", return_value=(session, "http://nas.test")):
+            self.assertEqual(nas.read("/vol1/music/test.mp3"), b"test bytes")
+        self.assertEqual(len(calls), 2)
+
+    def test_file_api_refuses_redirect(self):
+        def handler(r):
+            if r.method == "POST":
+                return httpx.Response(302, headers={"location": "https://other.test"})
+            raise AssertionError("must not follow redirect")
+        nas = NAS(self.s.config | {"reuse_fnos_session": True}, HTTP(httpx.Client(transport=httpx.MockTransport(handler))))
+        session = {"accessToken": "dummy", "accessTokenExpiresAt": time.time() + 3600}
+        with patch("music_bridge.nas.read_session", return_value=(session, "http://nas.test")):
+            with self.assertRaises(BridgeError):
+                nas.read("/vol1/music/test.mp3")
+
+    def test_session_reuse_requires_explicit_opt_in(self):
+        with self.assertRaises(BridgeError):
+            read_session(self.s.config)
+
+    def test_session_target_mismatch_rejected(self):
+        file = Path(self.tmp.name) / "session.json"
+        dump(file, {"host": "wrong.test", "port": 443, "scheme": "https", "accessToken": "dummy"})
+        file.chmod(0o600)
+        config = self.s.config | {"reuse_fnos_session": True, "nas_origin": "https://right.test", "fnos_session_file": str(file)}
+        with self.assertRaises(BridgeError):
+            read_session(config)
+
+    def test_review_candidates_stable_on_resume(self):
+        self.gd.search = lambda *a: [self.gd.candidate, self.gd.candidate | {"id": "124"}]
+        job = self.engine.create(self.manifest)
+        self.engine.run(job, dry_run=True)
+        self.gd.search = lambda *a: self.fail("must not search again")
+        self.engine.run(job, dry_run=True, selections={"1": {"source": "netease", "id": "124"}})
+        self.assertEqual(job["items"][0]["candidate"]["id"], "124")
+
+    def test_batch_commits_each_track_before_later_search_failure(self):
+        data = self.manifest | {"tracks": self.manifest["tracks"] + [{"name": "故障曲目", "artists": ["测试"]}]}
+        original = self.gd.search
+        def search(keyword, source):
+            if keyword.startswith("故障曲目"):
+                raise BridgeError("temporary search failure")
+            return original(keyword, source)
+        self.gd.search = search
+        job = self.engine.create(data)
+        result = self.run_job(job)
+        self.assertEqual(result["states"], {"saved": 1, "search_failed": 1})
+        self.assertFalse(Path(job["items"][0]["local"]).exists())
+        self.assertEqual(len(self.engine.index()["tracks"]), 1)
+
+    def test_batch_auth_pause_preserves_previous_commit(self):
+        data = self.manifest | {"tracks": self.manifest["tracks"] + [{"name": "授权失效", "artists": ["测试"]}]}
+        original = self.gd.search
+        def search(keyword, source):
+            if keyword.startswith("授权失效"):
+                raise AuthError("expired")
+            return original(keyword, source)
+        self.gd.search = search
+        job = self.engine.create(data)
+        with self.assertRaises(AuthError):
+            self.run_job(job)
+        self.assertFalse(Path(job["items"][0]["local"]).exists())
+        self.assertEqual(self.s.job(job["id"])["items"][1]["status"], "paused_auth")
+
+    def test_opt_in_first_exact_keeps_search_order_and_excludes_live(self):
+        self.s.config["match_policy"] = "first-exact"
+        c = self.gd.candidate
+        self.gd.search = lambda *a: [c | {"id": "live", "name": "晴天 (Live)"}, c | {"id": "124"}, c]
+        job = self.engine.create(self.manifest)
+        self.engine.run(job, dry_run=True)
+        self.assertEqual(job["items"][0]["candidate"]["id"], "124")
+
+    def test_opt_in_first_exact_reuses_existing_review_candidates(self):
+        c = self.gd.candidate
+        self.gd.search = lambda *a: [c | {"id": "124"}, c]
+        job = self.engine.create(self.manifest)
+        self.engine.run(job, dry_run=True)
+        self.assertEqual(job["items"][0]["status"], "needs_review")
+        self.s.config["match_policy"] = "first-exact"
+        self.gd.search = lambda *a: self.fail("must reuse reviewed candidates")
+        self.engine.run(job, dry_run=True)
+        self.assertEqual(job["items"][0]["candidate"]["id"], "124")
+
+    def test_audio_only_skips_optional_api_calls(self):
+        self.s.config["extras"] = False
+        self.gd.candidate = self.gd.candidate | {"pic_id": "pic", "lyric_id": "lyric"}
+        original = self.gd.call
+        def call(kind, source, **kwargs):
+            self.assertEqual(kind, "url")
+            return original(kind, source, **kwargs)
+        self.gd.call = call
+        self.assertEqual(self.run_job()["states"], {"saved": 1})
+
+    def test_committed_resume_does_not_reread_finished_audio(self):
+        job = self.engine.create(self.manifest)
+        self.run_job(job)
+        self.assertTrue(job["items"][0]["committed"])
+        self.nas.sha = lambda *a: self.fail("committed audio must not be reread")
+        self.assertEqual(self.run_job(self.s.job(job["id"]))["states"], {"saved": 1})
+
+    def test_move_expected_hash_only_rereads_final_path(self):
+        nas = NAS(self.s.config)
+        nas.ensure = lambda *a: None
+        nas.exists = lambda *a: False
+        nas.run = lambda *a, **kw: None
+        seen = []
+        expected = "a" * 64
+        nas.sha = lambda path: seen.append(path) or expected
+        nas.move(nas.root + "/stage/file.mp3", nas.root + "/final/file.mp3", expected_sha256=expected)
+        self.assertEqual(seen, [nas.root + "/final/file.mp3"])
+        nas.sha = lambda path: "wrong"
+        with self.assertRaises(BridgeError):
+            nas.move(nas.root + "/stage/file.mp3", nas.root + "/final/file.mp3", expected_sha256=expected)
+
+    def test_skip_failed_resume_does_not_search_again(self):
+        self.gd.search = lambda *a: []
+        job = self.engine.create(self.manifest)
+        self.engine.run(job, dry_run=True)
+        self.assertEqual(job["items"][0]["status"], "not_found")
+        self.gd.search = lambda *a: self.fail("failed item must not be retried")
+        self.assertEqual(self.engine.run(job, retry_failed=False)["states"], {"not_found": 1})
+
+    def test_traditional_chinese_artist_is_normalized(self):
+        track = {"name": "青花瓷", "artists": ["周杰伦"]}
+        candidate = {"name": "青花瓷", "artist": ["周杰倫"], "id": "1", "source": "joox"}
+        self.assertEqual(match(track, [candidate])[0], "matched")
+
+    def test_traditional_normalization_keeps_versions_and_name_markers(self):
+        track = {"name": "夜曲", "artists": ["周杰伦"]}
+        candidates = [{"name": "夜曲 (Live)", "artist": ["周杰倫"], "id": "1", "source": "joox"},
+                      {"name": "夜曲", "artist": ["周杰倫♚"], "id": "2", "source": "joox"}]
+        self.assertEqual(match(track, candidates)[0], "not_found")
+
+    def test_cleanup_locked_file_preserves_audio_and_success(self):
+        job = self.engine.create(self.manifest)
+        original_unlink = Path.unlink
+        def unlink(path, *args, **kwargs):
+            if path.suffix == ".mp3":
+                raise PermissionError("sharing violation")
+            return original_unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", unlink), patch("music_bridge.core.time.sleep"):
+            result = self.run_job(job)
+        self.assertEqual(result["states"], {"saved": 1})
+        item = job["items"][0]
+        self.assertTrue(item["local_cleanup_pending"])
+        self.assertTrue(Path(item["local"]).exists())
+
+    def test_atomic_metadata_retries_transient_sharing_violation(self):
+        import os
+        original_replace = os.replace
+        attempts = [0]
+        def replace(src, dest):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise PermissionError("temporary sharing violation")
+            return original_replace(src, dest)
+        path = Path(self.tmp.name) / "atomic.json"
+        with patch("music_bridge.core.os.replace", replace), patch("music_bridge.core.time.sleep"):
+            dump(path, {"complete": True})
+        self.assertEqual(json.loads(path.read_text()), {"complete": True})
+        self.assertEqual(attempts[0], 2)
 
 
 if __name__ == "__main__":

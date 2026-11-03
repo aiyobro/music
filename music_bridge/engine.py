@@ -9,7 +9,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from .api import GD, HTTP
-from .core import AuthError, BridgeError, digest, dump, identity, inside, load, local_lock, match, norm, safe
+from .core import AuthError, BridgeError, digest, dump, identity, inside, load, local_lock, match, norm, safe, retry_permission
 
 
 def probe(path, command="ffprobe"):
@@ -48,6 +48,7 @@ def tag(path, track, candidate):
 
 def summary(job):
     return {"id": job["id"], "total": len(job["items"]), "states": dict(collections.Counter(i["status"] for i in job["items"])),
+            "local_cleanup_pending": sum(bool(i.get("local_cleanup_pending")) for i in job["items"]),
             "warnings": job["manifest"].get("warnings", []), "report": job.get("report"),
             "temporary_directory": job.get("temporary_directory")}
 
@@ -113,7 +114,7 @@ class Engine:
         self.nas.put(owner, lock + "/owner.json")
         return lock
 
-    def run(self, job, dry_run=False, selections=None):
+    def run(self, job, dry_run=False, selections=None, retry_failed=True):
         if job["nas_root"] != self.root or job["nas_profile"] != self.state.config["nas_profile"]:
             raise BridgeError("任务 NAS 目标与当前配置不同")
         directory = self.base / job["id"]
@@ -128,9 +129,28 @@ class Engine:
             lock = self.acquire(job["id"])
             try:
                 index = self.index()
-                self.resolve(job, selections)
-                self.state.save_job(job)
-                for item in job["items"]:
+                for position, item in enumerate(job["items"], 1):
+                    if not retry_failed and item["status"] in ("not_found", "search_failed", "download_failed", "upload_failed"):
+                        continue
+                    # 同一任务已提交且本地已清理的记录，可用远端提交快照恢复，避免全曲回读。
+                    record = item.get("record", {})
+                    committed = index["tracks"].get(record.get("key"), {})
+                    if (item["status"] in ("saved", "existing") and (item.get("committed") or item.get("local_cleaned"))
+                            and committed.get("sha256") == record.get("sha256") and committed.get("path") == record.get("path")
+                            and not committed.get("quarantined") and self.nas.exists(inside(self.root, record["path"]))):
+                        continue
+                    # 批量任务逐曲匹配并持久化，不等待整张歌单搜索完才开始上传。
+                    try:
+                        self.resolve(job, selections, positions={position})
+                    except AuthError:
+                        item["status"] = "paused_auth"
+                        self.state.save_job(job)
+                        raise
+                    except BridgeError as e:
+                        item.update(status="search_failed", error=str(e))
+                        self.state.save_job(job)
+                        continue
+                    self.state.save_job(job)
                     if "candidate" not in item or item["status"] in ("needs_review", "not_found"):
                         continue
                     try:
@@ -143,7 +163,8 @@ class Engine:
                         item["status"] = "upload_failed" if item.get("local") else "download_failed"
                         item["error"] = str(e)
                     self.state.save_job(job)
-                    self.publish_json(directory, "index.json", index, self.root + "/.music-bridge/index.json")
+                    # 每首完成元数据提交后及时清理本地音频，限制中转盘占用。
+                    self.commit(job, directory, index)
                 self.commit(job, directory, index)
                 return summary(job)
             finally:
@@ -151,10 +172,27 @@ class Engine:
                 self.nas.remove(lock + "/owner.json")
                 self.nas.remove(lock)
 
-    def resolve(self, job, selections=None):
+    def resolve(self, job, selections=None, positions=None):
         selections = selections or {}
         for position, item in enumerate(job["items"], 1):
+            if positions is not None and position not in positions:
+                continue
             if item.get("candidate"):
+                continue
+            # 恢复时使用已展示的候选，不重新搜索导致用户选择失效或消耗配额。
+            if item.get("candidates") and (str(position) in selections or item["status"] == "needs_review"):
+                if str(position) in selections:
+                    choice = selections[str(position)]
+                    found = {(c["source"], str(c["id"])): c for c in item["candidates"]
+                             if c["source"] == choice["source"] and str(c["id"]) == str(choice["id"])}
+                    if len(found) != 1:
+                        raise BridgeError("人工选择不在已展示的候选中")
+                    item.update(status="matched", candidate=next(iter(found.values())), match_reason="用户确认已展示候选")
+                elif self.state.config.get("match_policy") == "first-exact":
+                    status, candidates = match(item["track"], item["candidates"])
+                    if status in ("matched", "needs_review"):
+                        chosen = candidates if status == "matched" else candidates[0]
+                        item.update(status="matched", candidate=chosen, match_reason="用户授权：完整歌名和歌手一致，按搜索排序选首条")
                 continue
             track = item["track"]
             if not track.get("name") or not all(track.get("artists", [])):
@@ -165,8 +203,11 @@ class Engine:
                 rows = self.gd.search(track["name"] + " " + " ".join(track["artists"]), source)
                 candidates.extend(rows)
                 status, result = match(track, rows)
+                ordered_choice = status == "needs_review" and self.state.config.get("match_policy") == "first-exact"
+                if ordered_choice:
+                    status, result = "matched", result[0]
                 if status == "matched":
-                    item.update(status=status, candidate=result, match_reason="完整歌名和歌手一致，源内唯一")
+                    item.update(status=status, candidate=result, match_reason="用户授权：完整歌名和歌手一致，按搜索排序选首条" if ordered_choice else "完整歌名和歌手一致，源内唯一")
                     break
                 if status == "needs_review":
                     item.update(status=status, candidates=rows)
@@ -219,7 +260,7 @@ class Engine:
             if not downloaded:
                 raise BridgeError("所有可用音质下载失败")
             local = directory / (safe(c["name"]) + " [" + key + "]." + info["extension"])
-            os.replace(part, local)
+            retry_permission(lambda: os.replace(part, local))
             tag(local, track, c)
             info = probe(local, self.state.config["ffprobe"])
             item.update(local=str(local), sha256=digest(local), media=info, actual_br=link.get("br"), actual_size_kb=link.get("size"))
@@ -232,16 +273,18 @@ class Engine:
         if self.nas.exists(dest):
             if self.nas.sha(dest) != item["sha256"]:
                 raise BridgeError("曲库同名文件内容不同")
+            # 仅删除本任务已验证的暂存副本，避免中断恢复留下重复音频。
+            self.nas.remove(stage)
         else:
-            self.nas.move(stage, dest)
-        if self.nas.sha(dest) != item["sha256"]:
-            raise BridgeError("最终曲库校验失败")
+            self.nas.move(stage, dest, expected_sha256=item["sha256"])
         record = {"key": key, "path": rel, "sha256": item["sha256"], "size": local.stat().st_size,
                   "name": c["name"], "artists": c["artist"], "album": c.get("album"),
                   "gd_source": c["source"], "gd_id": str(c["id"]), "media": item["media"], "actual_br": item["actual_br"],
                   "origins": [{"platform": track.get("platform"), "id": track.get("source_id"), "url": track.get("url")}]}
         index["tracks"][key] = record
         item.update(status="saved", record=record)
+        if not self.state.config.get("extras", True):
+            return
         for kind, field, suffix in (("lyric", "lyric_id", ".lrc"), ("pic", "pic_id", ".cover")):
             if not c.get(field):
                 continue
@@ -266,7 +309,7 @@ class Engine:
                     else:
                         raise BridgeError("封面不是支持的 JPEG/PNG 图片")
                     renamed = local.with_suffix(suffix)
-                    os.replace(extra, renamed)
+                    retry_permission(lambda: os.replace(extra, renamed))
                     extra = renamed
                 if extra.exists():
                     self.nas.put(extra, posixpath.splitext(dest)[0] + suffix)
@@ -300,11 +343,20 @@ class Engine:
         self.nas.put(report_csv, self.root + "/.music-bridge/jobs/" + job["id"] + "/report.csv", replace=True)
         # 远端索引、歌单和报告全部验证后才清理本任务的音频及附件。
         for item in job["items"]:
+            if item["status"] in ("saved", "existing"):
+                item["committed"] = True
             if item["status"] in ("saved", "existing") and item.get("local"):
                 p = Path(item["local"])
-                if p.resolve().is_relative_to(directory.resolve()) and p.exists() and digest(p) == item["sha256"]:
-                    p.unlink()
-                    for suffix in (".lrc", ".zh.lrc", ".cover", ".jpg", ".png"):
-                        p.with_suffix(suffix).unlink(missing_ok=True)
-                    item["local_cleaned"] = True
+                try:
+                    if p.resolve().is_relative_to(directory.resolve()) and p.exists() and digest(p) == item["sha256"]:
+                        for suffix in (".lrc", ".zh.lrc", ".cover", ".jpg", ".png"):
+                            retry_permission(lambda suffix=suffix: p.with_suffix(suffix).unlink(missing_ok=True))
+                        retry_permission(p.unlink)
+                        item["local_cleaned"] = True
+                        item.pop("local_cleanup_pending", None)
+                except PermissionError:
+                    item["local_cleanup_pending"] = True
+                    warning = "本地临时文件被占用或无删除权限，已保留，后续继续清理"
+                    if warning not in item.setdefault("warnings", []):
+                        item["warnings"].append(warning)
         self.state.save_job(job)

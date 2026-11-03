@@ -7,3 +7,4 @@ certifi==2026.10.23
 idna==3.20
 typing_extensions==4.16.0
 mutagen==1.48.1
+opencc-python-reimplemented==0.1.7

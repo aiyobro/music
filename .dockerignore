@@ -1,0 +1,8 @@
+.git
+.music-bridge
+.venv
+**/__pycache__
+*.egg-info
+.env
+tests
+docs

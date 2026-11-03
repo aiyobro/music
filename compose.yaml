@@ -1,0 +1,16 @@
+services:
+  music-bridge:
+    build: .
+    image: music-bridge:local
+    init: true
+    # 使用 NAS 用户的 UID/GID，避免生成 root 所有的曲库文件。
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      MUSIC_BRIDGE_HOME: /state
+      QQMUSIC_API_KEY: ${QQMUSIC_API_KEY:-}
+    volumes:
+      - ${MUSIC_DIR:?请设置 MUSIC_DIR}:/library
+      - ${STATE_DIR:?请设置 STATE_DIR}:/state
+      - ${IMPORT_DIR:?请设置 IMPORT_DIR}:/imports:ro
+    # 单次批任务，完成后退出；避免失败曲目被无休止地重试。
+    restart: "no"
